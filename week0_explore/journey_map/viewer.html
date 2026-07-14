@@ -263,6 +263,7 @@
   var activeZ = 0;
   var selectedRoom = null;
   var autoFollow = true;
+  var lastKnownCurrent = null;
   var lastUpdatedIso = null;
   var staleSince = null;
   // Recomputed every render() - "discovered" = visited + frontier only, NOT
@@ -1047,6 +1048,10 @@
       if (journey.updated_iso !== lastUpdatedIso) {
         lastUpdatedIso = journey.updated_iso;
         staleSince = null;
+      }
+      if (journey.current != null && journey.current !== lastKnownCurrent) {
+        lastKnownCurrent = journey.current;
+        if (autoFollow) selectedRoom = null; // snap the panel back to the current room on move
       }
       if (autoFollow && journey.current != null) {
         var r = world.rooms[String(journey.current)];
