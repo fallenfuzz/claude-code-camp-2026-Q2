@@ -10,6 +10,8 @@ real player would have to: by watching the room title, the exit list, and
 movement history, and narrowing down which room that must be. No vnums, no
 "goto" tricks.
 
+![Journey map viewer showing a partially explored Midgaard, the current room's full detail panel, and cross-zone neighbors](screenshot.png)
+
 ## What it is
 
 One Python process (`journey_map.py`, stdlib only, no pip/npm deps) that:
@@ -30,20 +32,21 @@ One Python process (`journey_map.py`, stdlib only, no pip/npm deps) that:
 
 And one self-contained `viewer.html` (vanilla JS + SVG, no CDN, no build
 step) that polls the state once a second and renders:
-- visited rooms, sector-colored (same palette as `preview`'s map view), each
-  labeled with its **full room name** - shown as one line where it fits,
-  wrapped to two where it doesn't, and only shrunk or (last resort, for the
-  rare 50+ character title) ellipsis-truncated if it still doesn't fit. Each
-  label is placed via greedy collision avoidance (tries below/above/right/
-  left of its room) against every other label and room square already
-  placed, so labels never overlap even in dense clusters (Midgaard's Main
-  Street area); a label that truly can't fit anywhere is dropped rather than
-  drawn on top of something else. The current/selected room is exempt from
-  being dropped - it always gets a label. Below a small zoom threshold only
-  the current/selected room is labeled at all, since anything else would
-  render too small to read regardless of placement.
+- visited rooms as boxes, sector-colored (same palette as `preview`'s map
+  view), each auto-sized to fully contain its **full room name** - wrapped
+  across up to three lines, with font shrunk (and, only for the rare
+  pathological 50+ character title, ellipsis-truncated) as a last resort.
+  Every box in a given frame shares the same size, computed from whichever
+  discovered room needs the most space, so names are always fully visible
+  and never overlap, even in dense clusters (Midgaard's Main Street area) -
+  nothing is ever dropped.
 - **frontier** rooms - unvisited but adjacent to a visited room via a known
   exit - as grey ghosts
+- **cross-zone neighbors** - discovered rooms one exit away in a different
+  zone - as dashed ghost boxes with a zone badge; clicking one switches the
+  map to that zone and selects the room, so a boundary crossing (e.g.
+  stepping into a newbie zone from Midgaard) never leaves the room you came
+  from invisible
 - the current room as a pulsing ring
 - ambiguous localization (candidate set > 1) as dashed "?" rooms
 - mob sightings (dot badge) plus "expected here" mobs and objects from zone
