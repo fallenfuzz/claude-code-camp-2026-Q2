@@ -5,4 +5,8 @@
 .env
 .env.local
 
+# Python bytecode cache (e.g. week0_explore/__pycache__/ from mud_protocol.py,
+# imported directly by journey_map/ and challenge_agent/ via sys.path)
+__pycache__/
+
 

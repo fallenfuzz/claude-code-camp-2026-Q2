@@ -26,8 +26,8 @@ play normally, or open http://localhost:4002/ in a browser to watch the map.
 import glob
 import json
 import os
-import re
 import socket
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -39,6 +39,16 @@ PREVIEW_WORLD_DIR = BASE_DIR.parent / "preview" / "data" / "world"
 STATE_PATH = BASE_DIR / "journey_state.json"
 VIEWER_PATH = BASE_DIR / "viewer.html"
 
+# TelnetStripper/SessionParser (pure protocol/ANSI decoding, no world
+# knowledge) live in ../mud_protocol.py, shared with challenge_agent/.
+# Extracted from this file 2026-07-17 - behavior-preserving move, see that
+# module's docstring.
+sys.path.insert(0, str(BASE_DIR.parent))
+from mud_protocol import (  # noqa: E402
+    ANSI_RE, CYAN, EXITS_RE, MOVE_ALIASES, PROMPT_RE, YELLOW,
+    SessionParser, TelnetStripper, normalize_text,
+)
+
 MUD_HOST = "localhost"
 MUD_PORT = 4000
 PROXY_PORT = 4001
@@ -47,32 +57,10 @@ HTTP_PORT = 4002
 # tbaMUD exit direction encoding: 0=n 1=e 2=s 3=w 4=u 5=d
 DIR_LETTERS = {0: "n", 1: "e", 2: "s", 3: "w", 4: "u", 5: "d"}
 DIR_VECTORS = {"n": (0, -1), "s": (0, 1), "e": (1, 0), "w": (-1, 0)}
-MOVE_ALIASES = {
-    "n": "n", "north": "n",
-    "e": "e", "east": "e",
-    "s": "s", "south": "s",
-    "w": "w", "west": "w",
-    "u": "u", "up": "u",
-    "d": "d", "down": "d",
-}
-
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-EXITS_RE = re.compile(r"^\[\s*Exits:\s*(.*?)\s*\]$")
-# Observed live prompt: "20H 100M 80V (news) (motd) > " (no trailing newline).
-PROMPT_RE = re.compile(r"\d+H\s+\d+M\s+\d+V\b.*>\s*$")
-
-YELLOW = "\x1b[0;33m"
-CYAN = "\x1b[0;36m"
 GREEN = "\x1b[0;32m"
 
 WORLD_JSON_BYTES = b"{}"
 JOURNEY = None
-
-
-def normalize_text(s):
-    """Strip ANSI codes and collapse whitespace, for line comparisons."""
-    s = ANSI_RE.sub("", s or "")
-    return " ".join(s.split()).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -243,8 +231,17 @@ def find_free_slot(occupied, cand):
     if cand not in occupied:
         return cand
     x, y, z = cand
-    nudges = [(0.5, 0), (0, 0.5), (-0.5, 0), (0, -0.5),
-              (0.5, 0.5), (-0.5, 0.5), (0.5, -0.5), (-0.5, -0.5)]
+    # Full grid-unit steps only - viewer.html renders one uniform box+gutter
+    # "pitch" per frame and positions every room at (x * pitch, y * pitch)
+    # with zero per-room collision math (see viewer.html computeBoxMetrics /
+    # roomCenter comments): that guarantee only holds if every occupied cell
+    # is a whole number of grid units from every other. A half-unit nudge
+    # here used to place a colliding room only half a box-width away from
+    # its neighbor, which the viewer then rendered as a visual overlap
+    # (e.g. "The Grunting Boar" / "The Weapon Shop"). Never use fractional
+    # steps.
+    nudges = [(1, 0), (0, 1), (-1, 0), (0, -1),
+              (1, 1), (-1, 1), (1, -1), (-1, -1)]
     step = 1
     for attempt in range(1, 200):
         for nx, ny in nudges:
@@ -254,131 +251,6 @@ def find_free_slot(occupied, cand):
         step += 1
     # Should not happen at this scale; deterministic last-resort fallback.
     return (x + 1000, y + 1000, z)
-
-
-# ---------------------------------------------------------------------------
-# Telnet IAC stripper (text extraction only - never touches forwarded bytes)
-# ---------------------------------------------------------------------------
-
-IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
-
-
-class TelnetStripper:
-    """Stateful (across chunks) telnet IAC negotiation stripper, used only to
-    get clean text for parsing. The proxy forwards the original raw bytes
-    untouched regardless of what this produces."""
-
-    def __init__(self):
-        self.state = "DATA"
-
-    def feed(self, data: bytes) -> str:
-        out = bytearray()
-        for b in data:
-            if self.state == "DATA":
-                if b == IAC:
-                    self.state = "IAC"
-                else:
-                    out.append(b)
-            elif self.state == "IAC":
-                if b == IAC:
-                    out.append(IAC)
-                    self.state = "DATA"
-                elif b in (DO, DONT, WILL, WONT):
-                    self.state = "NEG"
-                elif b == SB:
-                    self.state = "SB"
-                else:
-                    self.state = "DATA"
-            elif self.state == "NEG":
-                self.state = "DATA"
-            elif self.state == "SB":
-                if b == IAC:
-                    self.state = "SB_IAC"
-            elif self.state == "SB_IAC":
-                if b == SE:
-                    self.state = "DATA"
-                else:
-                    self.state = "SB"
-        return bytes(out).decode("latin-1")
-
-
-# ---------------------------------------------------------------------------
-# Stream parser: turns server->client text into resolved room blocks
-# ---------------------------------------------------------------------------
-
-class SessionParser:
-    """Per-session (one telnet connection through the proxy). Buffers server
-    text into lines, recognizes a full room block (title?...exits...entity
-    lines...prompt), and hands it to Journey.observe(). Non-room output
-    (failed moves, combat spam, async chatter, the login sequence) has no
-    exits line and is silently ignored."""
-
-    def __init__(self, journey):
-        self.journey = journey
-        self.stripper = TelnetStripper()
-        self.buf = ""
-        self.pending_lines = []
-        self.command_queue = []
-
-    def note_command(self, cmd):
-        cmd = cmd.strip().lower()
-        if cmd:
-            self.command_queue.append(cmd)
-
-    def feed_server_bytes(self, data: bytes):
-        text = self.stripper.feed(data)
-        if not text:
-            return
-        self.buf += text
-        while True:
-            idx = self.buf.find("\n")
-            if idx == -1:
-                break
-            raw_line = self.buf[:idx]
-            self.buf = self.buf[idx + 1:]
-            if raw_line.endswith("\r"):
-                raw_line = raw_line[:-1]
-            stripped = normalize_text(raw_line)
-            if stripped:
-                self.pending_lines.append((raw_line, stripped))
-
-        # The prompt has no trailing newline - it is whatever is left in buf.
-        remainder_stripped = normalize_text(self.buf)
-        if remainder_stripped and PROMPT_RE.search(remainder_stripped):
-            self.buf = ""
-            self._resolve_block()
-
-    def _resolve_block(self):
-        lines = self.pending_lines
-        self.pending_lines = []
-        cmd = self.command_queue.pop(0) if self.command_queue else None
-
-        exits_idx = None
-        exit_letters = []
-        for i, (raw, stripped) in enumerate(lines):
-            if raw.startswith(CYAN):
-                m = EXITS_RE.match(stripped)
-                if m:
-                    exits_idx = i
-                    exit_letters = m.group(1).split()
-                    break
-
-        if exits_idx is None:
-            # Not a room block: failed move, combat spam, tells/channels,
-            # login/menu text, etc. State is untouched.
-            return
-
-        title = None
-        for raw, stripped in lines[:exits_idx]:
-            if raw.startswith(YELLOW):
-                title = stripped
-                break
-
-        mob_lines = [stripped for raw, stripped in lines[exits_idx + 1:]
-                     if raw.startswith(YELLOW)]
-
-        move_dir = MOVE_ALIASES.get(cmd) if cmd else None
-        self.journey.observe(title, exit_letters, move_dir, mob_lines)
 
 
 # ---------------------------------------------------------------------------
